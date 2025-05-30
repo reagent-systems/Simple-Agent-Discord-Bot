@@ -37,6 +37,12 @@ class SimpleAgentCommand(commands.Cog):
         
         # File managers for each session: session_id -> SessionFileManager
         self.file_managers: Dict[str, SessionFileManager] = {}
+        
+        # File creation batching: session_id -> {'files': [...], 'task': asyncio.Task}
+        self.file_batches: Dict[str, Dict] = {}
+        
+        # Tool call batching: session_id -> {'tools': [...], 'task': asyncio.Task}
+        self.tool_batches: Dict[str, Dict] = {}
     
     @app_commands.command(
         name="simple_agent",
@@ -148,7 +154,8 @@ class SimpleAgentCommand(commands.Cog):
             # Create file manager for this session
             file_manager = SessionFileManager(
                 session_id,
-                self.config.websocket_server_url
+                self.config.websocket_server_url,
+                self.config
             )
             
             # Set up event handlers
@@ -159,12 +166,39 @@ class SimpleAgentCommand(commands.Cog):
             self.session_threads[session_id] = thread.id
             self.file_managers[session_id] = file_manager
             
-            # Connect and start the agent
-            if await ws_client.connect():
-                await ws_client.run_agent(prompt, max_steps, auto_steps)
-            else:
-                await thread.send("❌ Failed to connect to Simple Agent server")
-                await self._cleanup_session(session_id)
+            # Connect and start the agent with retry logic
+            max_retries = 3
+            retry_delay = 2  # seconds
+            
+            for attempt in range(max_retries):
+                try:
+                    if attempt > 0:
+                        # Update status to show retry attempt
+                        retry_embed = self.message_formatter.create_status_embed(
+                            f"🔄 Connection Attempt {attempt + 1}/{max_retries}",
+                            "Retrying connection to Simple Agent server...",
+                            discord.Color.orange()
+                        )
+                        await initial_msg.edit(embed=retry_embed)
+                        await asyncio.sleep(retry_delay)
+                    
+                    if await ws_client.connect():
+                        await ws_client.run_agent(prompt, max_steps, auto_steps)
+                        break  # Success - exit retry loop
+                    else:
+                        if attempt == max_retries - 1:
+                            # Final attempt failed
+                            await thread.send("❌ Failed to connect to Simple Agent server after multiple attempts")
+                            await self._cleanup_session(session_id)
+                        # Continue to next retry attempt
+                        
+                except Exception as e:
+                    logger.error(f"Connection attempt {attempt + 1} failed: {e}")
+                    if attempt == max_retries - 1:
+                        # Final attempt failed with exception
+                        await thread.send(f"❌ Failed to connect to Simple Agent server: {str(e)}")
+                        await self._cleanup_session(session_id)
+                    # Continue to next retry attempt
         
         except Exception as e:
             logger.error(f"Error in simple_agent_command: {e}", exc_info=True)
@@ -205,14 +239,14 @@ class SimpleAgentCommand(commands.Cog):
                 discord.Color.blue()
             )
             await thread.send(embed=embed)
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(self.config.message_delay)
         
         async def on_assistant_message(data):
             message = data.get('message', data.get('content', ''))
             if message:
                 embed = self.message_formatter.create_assistant_message_embed(message)
                 await thread.send(embed=embed)
-                await asyncio.sleep(0.3)
+                await asyncio.sleep(self.config.message_delay)
         
         async def on_tool_call(data):
             # Get tool name from primary or alternative fields
@@ -234,9 +268,12 @@ class SimpleAgentCommand(commands.Cog):
             logger.debug(f"Tool call data: {data}")
             logger.debug(f"Parsed tool: {tool_name}, description: {description}")
             
-            embed = self.message_formatter.create_tool_call_embed(tool_name, description)
-            await thread.send(embed=embed)
-            await asyncio.sleep(0.3)
+            # Add to batch instead of sending immediately
+            tool_info = {
+                'tool_name': tool_name,
+                'description': description
+            }
+            await self._add_tool_to_batch(session_id, thread, tool_info)
         
         async def on_tool_result(data):
             # Get result from primary or alternative fields
@@ -262,7 +299,7 @@ class SimpleAgentCommand(commands.Cog):
             
             embed = self.message_formatter.create_tool_result_embed(tool_name, result, success)
             await thread.send(embed=embed)
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(self.config.message_delay)
         
         async def on_step_summary(data):
             summary = data.get('summary', data.get('content', ''))
@@ -270,13 +307,13 @@ class SimpleAgentCommand(commands.Cog):
             if summary:
                 embed = self.message_formatter.create_step_summary_embed(step_num, summary)
                 await thread.send(embed=embed)
-                await asyncio.sleep(0.3)
+                await asyncio.sleep(self.config.message_delay)
         
         async def on_final_summary(data):
             summary = data.get('summary', data.get('content', 'Task completed'))
             embed = self.message_formatter.create_completion_embed(summary)
             await thread.send(embed=embed)
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(self.config.message_delay)
         
         async def on_file_created(data):
             # Update file manager session ID if provided in the event
@@ -305,7 +342,7 @@ class SimpleAgentCommand(commands.Cog):
             # Based on the tool calls, files are typically created in output/ directory
             if not file_path and file_name:
                 file_path = f"output/{file_name}"
-                logger.info(f"Constructed file path from name: {file_name} -> {file_path}")
+                logger.debug(f"Constructed file path from name: {file_name} -> {file_path}")
             
             # Use file_path as primary, fallback to name
             display_path = file_path or file_name or "Unknown file"
@@ -322,15 +359,12 @@ class SimpleAgentCommand(commands.Cog):
             logger.debug(f"File created data: {data}")
             logger.debug(f"Final file path: {file_path}, display: {display_path}")
             
-            embed = self.message_formatter.create_status_embed(
-                "📄 File Created",
-                f"Created file: `{display_path}`",
-                discord.Color.purple()
-            )
-            await thread.send(embed=embed)
-            
-            # Add small delay to avoid rate limiting
-            await asyncio.sleep(0.5)
+            # Add to batch instead of sending immediately
+            file_info = {
+                'file_path': file_path,
+                'display_path': display_path
+            }
+            await self._add_file_to_batch(session_id, thread, file_info)
         
         async def on_directory_changed(data):
             directory = data.get('path', data.get('directory', 'Unknown directory'))
@@ -340,7 +374,7 @@ class SimpleAgentCommand(commands.Cog):
                 discord.Color.orange()
             )
             await thread.send(embed=embed)
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(self.config.message_delay)
         
         async def on_waiting_for_input(data):
             question = data.get('question', data.get('message', 'The agent is waiting for your input.'))
@@ -362,7 +396,7 @@ class SimpleAgentCommand(commands.Cog):
             )
             
             msg = await thread.send(embed=embed)
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(self.config.message_delay)
             
             # Set up input collection
             await self._handle_user_input_request(thread, ws_client, session_id)
@@ -371,7 +405,7 @@ class SimpleAgentCommand(commands.Cog):
             result = data.get('result', data.get('message', 'Task completed successfully!'))
             embed = self.message_formatter.create_completion_embed(result)
             await thread.send(embed=embed)
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(self.config.message_delay)
         
         async def on_agent_finished(data):
             embed = self.message_formatter.create_status_embed(
@@ -380,7 +414,7 @@ class SimpleAgentCommand(commands.Cog):
                 discord.Color.green()
             )
             await thread.send(embed=embed)
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(self.config.message_delay)
             
             # Send all created files to the thread
             if file_manager.get_file_count() > 0:
@@ -392,7 +426,7 @@ class SimpleAgentCommand(commands.Cog):
             error = data.get('error', data.get('message', 'An unknown error occurred'))
             embed = self.message_formatter.create_error_embed(error)
             await thread.send(embed=embed)
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(self.config.message_delay)
             
             # Still send files if any were created before the error
             if file_manager.get_file_count() > 0:
@@ -443,7 +477,7 @@ class SimpleAgentCommand(commands.Cog):
             while True:
                 # Wait for either the correct user or any other user
                 done, pending = await asyncio.wait([
-                    asyncio.create_task(self.bot.wait_for('message', check=check, timeout=600)),
+                    asyncio.create_task(self.bot.wait_for('message', check=check, timeout=self.config.user_input_timeout)),
                     asyncio.create_task(self.bot.wait_for('message', check=other_user_check, timeout=1))
                 ], return_when=asyncio.FIRST_COMPLETED)
                 
@@ -520,6 +554,20 @@ class SimpleAgentCommand(commands.Cog):
             self.file_managers[session_id].clear_files()
             del self.file_managers[session_id]
         
+        # Clean up any pending file batches
+        if session_id in self.file_batches:
+            batch_info = self.file_batches[session_id]
+            if batch_info.get('task') and not batch_info['task'].done():
+                batch_info['task'].cancel()
+            del self.file_batches[session_id]
+        
+        # Clean up any pending tool batches
+        if session_id in self.tool_batches:
+            batch_info = self.tool_batches[session_id]
+            if batch_info.get('task') and not batch_info['task'].done():
+                batch_info['task'].cancel()
+            del self.tool_batches[session_id]
+        
         logger.info(f"Cleaned up session {session_id}")
     
     @app_commands.command(
@@ -593,4 +641,134 @@ class SimpleAgentCommand(commands.Cog):
         for session_id in list(self.active_sessions.keys()):
             await self._cleanup_session(session_id)
         
-        logger.info("All sessions cleaned up") 
+        logger.info("All sessions cleaned up")
+    
+    async def _send_batched_file_notification(self, session_id: str, thread: discord.Thread):
+        """Send a batched notification for multiple file creations."""
+        if session_id not in self.file_batches:
+            return
+        
+        batch_info = self.file_batches[session_id]
+        files = batch_info.get('files', [])
+        
+        if not files:
+            return
+        
+        try:
+            if len(files) == 1:
+                # Single file - send individual notification
+                file_info = files[0]
+                embed = self.message_formatter.create_status_embed(
+                    "📄 File Created",
+                    f"Created file: `{file_info['display_path']}`",
+                    discord.Color.purple()
+                )
+                await thread.send(embed=embed)
+            else:
+                # Multiple files - send batch notification
+                file_list = []
+                for file_info in files[:10]:  # Show max 10 files in preview
+                    file_list.append(f"• `{file_info['display_path']}`")
+                
+                if len(files) > 10:
+                    file_list.append(f"• ... and {len(files) - 10} more files")
+                
+                embed = self.message_formatter.create_status_embed(
+                    f"📁 Created {len(files)} Files",
+                    "\n".join(file_list),
+                    discord.Color.purple()
+                )
+                await thread.send(embed=embed)
+            
+            # Clear the batch
+            del self.file_batches[session_id]
+            
+        except Exception as e:
+            logger.error(f"Error sending batched file notification: {e}")
+    
+    async def _add_file_to_batch(self, session_id: str, thread: discord.Thread, file_info: dict):
+        """Add a file to the batch and handle timing."""
+        # Initialize batch if not exists
+        if session_id not in self.file_batches:
+            self.file_batches[session_id] = {'files': [], 'task': None}
+        
+        batch_info = self.file_batches[session_id]
+        batch_info['files'].append(file_info)
+        
+        # Cancel existing timer
+        if batch_info['task'] and not batch_info['task'].done():
+            batch_info['task'].cancel()
+        
+        # Set new timer for batch sending (2 seconds)
+        async def send_after_delay():
+            await asyncio.sleep(self.config.file_batch_delay)
+            await self._send_batched_file_notification(session_id, thread)
+        
+        batch_info['task'] = asyncio.create_task(send_after_delay())
+    
+    async def _send_batched_tool_notification(self, session_id: str, thread: discord.Thread):
+        """Send a batched notification for multiple tool calls."""
+        if session_id not in self.tool_batches:
+            return
+        
+        batch_info = self.tool_batches[session_id]
+        tools = batch_info.get('tools', [])
+        
+        if not tools:
+            return
+        
+        try:
+            if len(tools) == 1:
+                # Single tool - send individual notification
+                tool_info = tools[0]
+                embed = self.message_formatter.create_tool_call_embed(
+                    tool_info['tool_name'], 
+                    tool_info['description']
+                )
+                await thread.send(embed=embed)
+            else:
+                # Multiple tools - send batch notification
+                tool_list = []
+                for tool_info in tools[:8]:  # Show max 8 tools in preview
+                    tool_name = tool_info['tool_name']
+                    # Truncate long descriptions for batch view
+                    desc = tool_info['description']
+                    if len(desc) > 50:
+                        desc = desc[:47] + "..."
+                    tool_list.append(f"• **{tool_name}**: {desc}")
+                
+                if len(tools) > 8:
+                    tool_list.append(f"• ... and {len(tools) - 8} more tools")
+                
+                embed = self.message_formatter.create_status_embed(
+                    f"🔧 Executed {len(tools)} Tools",
+                    "\n".join(tool_list),
+                    discord.Color.blue()
+                )
+                await thread.send(embed=embed)
+            
+            # Clear the batch
+            del self.tool_batches[session_id]
+            
+        except Exception as e:
+            logger.error(f"Error sending batched tool notification: {e}")
+    
+    async def _add_tool_to_batch(self, session_id: str, thread: discord.Thread, tool_info: dict):
+        """Add a tool call to the batch and handle timing."""
+        # Initialize batch if not exists
+        if session_id not in self.tool_batches:
+            self.tool_batches[session_id] = {'tools': [], 'task': None}
+        
+        batch_info = self.tool_batches[session_id]
+        batch_info['tools'].append(tool_info)
+        
+        # Cancel existing timer
+        if batch_info['task'] and not batch_info['task'].done():
+            batch_info['task'].cancel()
+        
+        # Set new timer for batch sending (1.5 seconds - shorter than files since tools are quicker)
+        async def send_after_delay():
+            await asyncio.sleep(self.config.tool_batch_delay)
+            await self._send_batched_tool_notification(session_id, thread)
+        
+        batch_info['task'] = asyncio.create_task(send_after_delay()) 

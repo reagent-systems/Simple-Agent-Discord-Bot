@@ -25,13 +25,28 @@ class Config:
         
         # Bot Configuration
         self.bot_prefix = os.getenv('BOT_PREFIX', '/')
-        self.default_max_steps = self._get_int('DEFAULT_MAX_STEPS', 20)
-        self.default_auto_steps = self._get_int('DEFAULT_AUTO_STEPS', 10)
+        self.default_max_steps = int(os.getenv('DEFAULT_MAX_STEPS', '20'))
+        self.default_auto_steps = int(os.getenv('DEFAULT_AUTO_STEPS', '10'))
         self.max_thread_messages = self._get_int('MAX_THREAD_MESSAGES', 50)
         
         # Logging Configuration
         self.log_level = os.getenv('LOG_LEVEL', 'INFO')
         self.log_file = os.getenv('LOG_FILE', 'logs/discord_bot.log')
+        
+        # Timing configuration (in seconds)
+        # Message rate limiting delays - controls delay between Discord messages
+        self.message_delay = float(os.getenv('MESSAGE_DELAY', '0.3'))  # General message delay
+        self.file_message_delay = float(os.getenv('FILE_MESSAGE_DELAY', '0.5'))  # File summary delay
+        
+        # Batching delays - controls how long to wait before sending batched notifications
+        self.file_batch_delay = float(os.getenv('FILE_BATCH_DELAY', '2.0'))  # File creation batching
+        self.tool_batch_delay = float(os.getenv('TOOL_BATCH_DELAY', '1.5'))  # Tool call batching
+        
+        # File download timeout - how long to wait for file downloads
+        self.file_download_timeout = int(os.getenv('FILE_DOWNLOAD_TIMEOUT', '30'))
+        
+        # User input timeout - how long to wait for user responses (10 minutes default)
+        self.user_input_timeout = int(os.getenv('USER_INPUT_TIMEOUT', '600'))
         
         # Validate required settings
         self._validate_config()

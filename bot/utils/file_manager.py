@@ -19,17 +19,19 @@ logger = logging.getLogger(__name__)
 class SessionFileManager:
     """Manages files created during a Simple Agent session."""
     
-    def __init__(self, session_id: str, websocket_server_url: str):
+    def __init__(self, session_id: str, websocket_server_url: str, config=None):
         """
         Initialize the file manager.
         
         Args:
             session_id: Unique session identifier
             websocket_server_url: URL of the Simple Agent WebSocket server
+            config: Configuration object for timeouts
         """
         self.session_id = session_id
         self.websocket_server_url = websocket_server_url.rstrip('/')
         self.created_files: List[Dict[str, str]] = []
+        self.config = config
     
     def add_file(self, file_path: str, file_type: str = "file"):
         """
@@ -70,7 +72,8 @@ class SessionFileManager:
             
             async with aiohttp.ClientSession() as session:
                 logger.debug(f"Downloading file content from: {content_url}")
-                async with session.get(content_url, timeout=aiohttp.ClientTimeout(total=30)) as response:
+                timeout_seconds = self.config.file_download_timeout if self.config else 30
+                async with session.get(content_url, timeout=aiohttp.ClientTimeout(total=timeout_seconds)) as response:
                     if response.status == 200:
                         content = await response.read()  # Get as bytes
                         logger.info(f"Successfully downloaded file: {file_path} ({len(content)} bytes)")
@@ -188,7 +191,8 @@ class SessionFileManager:
             )
             
             await thread.send(embed=summary_embed)
-            await asyncio.sleep(0.5)
+            file_delay = self.config.file_message_delay if self.config else 0.5
+            await asyncio.sleep(file_delay)
             
             # Download all files
             temp_files = []
