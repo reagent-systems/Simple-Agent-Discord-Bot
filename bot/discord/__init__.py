@@ -1,0 +1,1 @@
+"""Discord-specific functionality like thread management and message formatting.""" 

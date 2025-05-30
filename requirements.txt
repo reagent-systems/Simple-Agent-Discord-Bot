@@ -1,0 +1,5 @@
+discord.py
+python-socketio[client]
+python-dotenv
+aiohttp
+asyncio-mqtt

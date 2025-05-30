@@ -1,0 +1,1 @@
+"""WebSocket client for communicating with Simple Agent server.""" 
